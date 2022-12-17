@@ -1,8 +1,10 @@
 # Real MySQL 8.0 스터디
 
-<img width="50%" src="./src/image/cover.png" align="left"/>
+<span align="left"><img width="50%" src="./src/image/cover.png"/></span>
 
-<br>
+</br>
+
+-----
 
 ## 📆 개요
 
