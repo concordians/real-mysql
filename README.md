@@ -38,6 +38,15 @@
 
 <br>
 
+## PR 규칙
+
+- 브랜치명: `챕터번호/닉네임`(e.g. 02/sun)
+- 파일명: `my-sql/chapter{N}/` 경로의 `N_제목_이름` (e.g. my-sql/chapter02/02\_설치와설정_전선규.md)
+- PR: main 브랜치로 직접 pr (e.g. 02/sun -> main)
+- PR명: 제목 앞에 `[N장]` 포함, 이외 자유(e.g. [2장] 설치와 설정)
+
+<br>
+
 ## 기타
 
 - git 사용 방법 및 pr 방식 등은 [git-basic](./documents/git-basic/README.md)을 참고해주세요.
