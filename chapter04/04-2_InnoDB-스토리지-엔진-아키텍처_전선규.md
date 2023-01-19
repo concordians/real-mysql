@@ -17,6 +17,13 @@
 >     - LRU_list 플러시
 >   - [4.2.7.5 버퍼 풀 상태 백업 및 복구](#4.2.7.5-버퍼-풀-상태-백업-및-복구)
 > - [4.2.8 Double Write Buffer](#4.2.8-Double-Write-Buffer)
+> - [4.2.9 언두 로그](#4.2.9-언두-로그)
+>   - [4.2.9.1 언두 로그 모니터링](#4.2.9.1-언두-로그-모니터링)
+>   - [4.2.9.2 언두 테이블스페이스 관리](#4.2.9.2-언두-테이블스페이스-관리)
+> - [4.2.10 체인지 버퍼](#4.2.10-체인지-버퍼)
+> - [4.2.11 리두 로그 및 로그 버퍼](#4.2.11-리두-로그-및-로그-버퍼)
+> - [4.2.12 어댑티브 해시 인덱스](#4.2.12-어댑티브-해시-인덱스)
+> - [4.2.13 InnoDB와 MyISAM, MEMORY 스토리지 엔진 비교](#4.2.13-InnoDB와-MyISAM,-MEMORY-스토리지-엔진-비교)
 
 <br>
 
@@ -621,3 +628,493 @@ innodb_buffer_pool_size=20G  --메모리 상황에 맞게 할당
   - 만약 DB 서버 성능을 위해 InnoDB 리두 로그 동기화 설정`innodb_flush_log_at_trx_commit`을 1이 아닌 값으로 설정했다면 DoubleWrite도 비활성화하는 것이 좋음
 
     (리두 로그는 동기화하지 않으면서 DoubleWrite만 비활성화하는 것은 맞지 않음)
+
+<br>
+
+### 4.2.9 언두 로그
+
+> InnoDB 스토리지엔진은 트랜잭션과 격리 수준 보장을 위해 DML로 변경되기 이전의 데이터를 별도로 백업하고, 이렇게 백업된 데이터를 undo log라 함
+
+##### undo log
+
+- 트랜잭션 보장
+  - 트랜잭션이 롤백되면 트랜잭션 도중 변경된 데이터를 변경 전 데이터로 복구하는데, 이 때 언두 로그에 백업해 둔 이전 버전의 데이터를 이용해 복구
+- 격리 수준 보장
+  - 특정 커넥션에서 데이터를 변경하는 도중에 다른 커넥션에서 데이터를 조회하면, 트랜잭션 격리 수준에 맞게 변경 중인 레코드를 읽지 않고 언두 로그에 백업해둔 데이터를 읽어 반환하기도 함
+
+<br>
+
+##### 4.2.9.1 언두 로그 모니터링
+
+- 트랜잭션의 롤백 대비용
+
+  - DML 실행 시 데이터 파일(데이터/인덱스 버퍼)은 신규 데이터로 변경되고, undo 영역에 기존 데이터 백업
+  - commit 시 현재 상태 유지, rollback 시 undo 영역 백업 데이터를 복구
+
+- 트랜잭션 격리 수준을 유지하며 높은 동시성 제공
+
+  *5.4.3 'repeatable read' 참조*
+
+- undo 영역
+
+  <img src="./images/sun_4-16.jpg" alt="drawing" width="50%" align="left" />
+
+  - 문제점
+
+    - 5.5 이전 버전에서는 한 번 증가한 언두 로그 공간이 줄어들지 않았음
+    - 대용량의 데이터를 처리하는 트랜잭션 또는 트랜잭션이 오랫동안 실행되면 언두 로그를 삭제할 수 없어 그 양이 급격히 증가할 수 있음(그림 4.16)
+    - 언두 로그가 늘어나면 디스크 사용량 뿐만 아니라, 백업 시 해당 용량만큼 더 복사해야 하는 문제점 발생
+
+  - 해결
+
+    - 8.0 버전부터 언두 로그를 돌아가면서 순차적으로 사용해 디스크 공간을 줄이는 것이 가능해짐
+    - 때로는 MySQL 서버가 필요한 시점에 사용 공간을 자동으로 줄여줌
+
+  - 하지만 서비스 중인 MySQL 서버에서 활성 상태의 트랜잭션이 장시간 유지되면 성능상 여전히 좋지 않음. 따라서 언두 로그가 얼마나 증가했는지 모니터링하는 것이 좋음
+
+    - 로그 건수 확인
+
+      ```sql
+      SHOW ENGINE INNODB STATUS;
+      ```
+
+      ```txt
+      =====================================
+      2023-01-19 18:52:31 0x16efa3000 INNODB MONITOR OUTPUT
+      =====================================
+      Per second averages calculated from the last 14 seconds
+      ...
+      ------------
+      TRANSACTIONS
+      ------------
+      Trx id counter 12298
+      Purge done for trx's n:o < 12295 undo n:o < 0 state: running but idle
+      History list length 3
+      ...
+      ----------------------------
+      END OF INNODB MONITOR OUTPUT
+      ============================
+      ```
+
+      - 서버별로 안정적 시점의 언두 로그 건수를 확인해 이를 기준으로 언두 로그의 급증 여부를 모니터링할 수 있음
+      - insert 언두 로그 & update/delete 언두 로그는 별도 관리
+        - update/delete는 MVCC와 롤백/데이터 복구에 모두 사용
+        - insert는 롤백/데이터 복구에만 사용
+        - 따라서 위 History list length 건수는 update/delete 갯수만 표시
+
+##### 4.2.9.2 언두 테이블스페이스 관리
+
+> undo tablespace: 언두 로그가 저장되는 공간
+
+- 저장 장소
+
+  - 5.6 이전: ibdata.ibd(언두 로그는 서버 초기화 시 생성되기 때문에 확장 한계)
+  - 5.6: innodb_undo_tablespaces 시스템 변수 도입(2보다 큰 값 설정 시 별도 언두 로그 파일 사용)
+  - 8.0.14 이후: innodb_undo_tablespaces 시스템 변수 deprecated & 항상 별도 로그 파일 사용
+
+- 구성 형태
+
+  <img src="./images/sun_4-17.jpg" alt="drawing" width="50%" align="left" />
+
+  - 1~128 rollback-segment per undo-tablespace
+
+  - rollback-segment는 1개 이상의 undo slot을 가짐
+  - rollback segment
+    - InnoDB 페이지 크기를 16byte로 나눈 값의 개수만큼의 언두 슬롯을 가짐
+
+- 최대 트랜잭션 갯수
+
+  - 기본 설정
+
+    `innodb_undo_tablespaces=2`
+
+    `innodb_rollback_segments=128`
+
+  - 최대 동시 트랜잭션 수(가장 기본적인 페이지 크기(16KB) InnoDB 가정)
+
+    - (InnoDB 페이지 크기) / 16 * (롤백 세그먼트 수) * (언두 테이블스페이스 수)
+
+    - 16 * 1024 / 16 * 128 * 2 / 2 개
+
+      (undo slot(16byte) -> 하나의 트랜잭션이 필요한 언두 슬롯의 수는 insert/update/delete 문장의 특성에 따라 최대 4개까지 사용하지만, 일반적으로 트랜잭션이 임시 테이블을 사용하지 않으므로 하나의 트랜잭션 당 대략 2개 정도의 언두 슬롯을 필요로 한다고 가정할 때의 계산)
+
+  - 동시 트랜잭션이 이만큼 필요하진 않겠지만, 기본 설정 유지 추천
+
+    - 슬롯 부족한 경우 트랜잭션 시작할 수 없는 심각한 문제 발생
+
+- 동적 추가/삭제
+
+  - 8.0부터 언두 테이블스페이스 동적으로 추가/삭제 가능
+
+    ```SQL
+    # select
+    SELECT TABLESPACE_NAME, FILE_NAME
+    FROM INFORMATION_SCHEMA.FILES
+    WHERE FILE_TYPE LIKE 'UNDO LOG';
+    
+    # create
+    CREATE UNDO TABLESPACE {tableSpaceName:=extra_undo_003} ADD DATAFILE '/data/undo_dir/undo_003.ibu';
+    
+    # undo tablespace inactive
+    ALTER UNDO TABLESPACE extra_undo_003 SET INACTIVE;
+    
+    # delete inactive undo tablespace
+    DROP UNDO TABLESPACE extra_undo_003;
+    ```
+
+- undo tablespace truncate
+
+  - 언두 테이블스페이스 공간을 필요한 만큼만 남기고 불필요하거나 과도하게 할당된 공간을 운영체제로 반납하는 것
+
+  - 자동 모드
+
+    - `innodb_undo_log_truncate=ON`
+
+      **Undo Purge**: InnoDB 스토리지 엔진의 퍼지 스레드(Purge Thread)가 주기적으로 불필요한 언두 로그 삭제 작업 실행
+
+    - `innodb_purge_rseg_truncate_frequency=128` default 128 / min 1 ~ max 128
+
+      ```txt
+      Defines the frequency with which the purge system frees rollback segments in terms of the number of times that purge is invoked. An undo tablespace cannot be truncated until its rollback segments are freed. Normally, the purge system frees rollback segments once every 128 times that purge is invoked. The default value is 128. Reducing this value increases the frequency with which the purge thread frees rollback segments.
+      ```
+
+      기본 설정 시 purge 호출 128번마다 purge system이 rollback segments를 한 번 해제
+
+  - 수동 모드
+
+    - `innodb_undo_log_truncate=OFF` 일 때 자동 실행 되지 않거나, 자동 undo purge가 부진할 경우 수동으로 언두 테이블스페이스를 비활성화해서 더이상 사용되지 않도록 설정
+
+    - ```sql
+      ALTER UNDO TABLESPACE {tablespace_name} SET INACTIVE
+      ```
+
+      - 더 이상 사용하지 않으므로, undo purge 되어 운영체제에 공간 반납
+      - 완료되면 다시 활성화 필요
+      - 수동모드는 undo tablespace가 최소 3개 이상되어야 작동
+
+<br>
+
+### 4.2.10 체인지 버퍼
+
+> 인덱스 페이지를 디스크로부터 읽어와서 업데이트해야 한다면, 이를 즉시 실행시키지 않고 임시로 저장해두고 사용자에게 결과를 반환하는 메모리 공간
+>
+> - record insert/update 시 index 업데이트 작업도 필요
+> - index 업데이트 작업
+>   - 버퍼 풀에 있으면 바로 업데이트 수행
+>   - 버퍼 풀에 없으면 디스크에서 랜덤하게 읽어올 때 자원 소모하므로 체인지 버퍼 메모리 활용
+
+- 사용자에게 결과 전달 전 반드시 중복 여부 체크해야 하는 unique 인덱스는 체인지 버퍼 사용 불가
+
+- Buffer Merge Thread
+
+  - 체인지 버퍼에 임시로 저장된 인덱스 레코드 조각이 버퍼 머지 스레드(백그라운드 스레드)에 의해 병합
+
+- 설정
+
+  `innodb_change_buffering=all`
+
+  - all: 모든 인덱스 관련 작업(inserts, deletes, purges) 버퍼링
+  - none: 버퍼링 안함
+  - inserts: 인덱스에 새로운 아이템 추가하는 작업
+  - deletes: 인덱스에서 기존 아이템 삭제하는 작업(삭제되었다는 마킹 작업)
+  - changes: 인덱스에 추가하고 삭제하는 작업(inserts, delets)
+  - purges: 인덱스 아이템을 영구적으로 삭제하는 작업(백그라운드 작업)
+
+- 메모리 사용
+
+  - `innodb_change_buffer_max_size=25`
+
+    - default 25% ~ max 50%까지 설정
+    - 체인지 버퍼가 너무 많은 버퍼 풀 공간을 사용하지 못하도록 하거나, insert/update 등이 너무 빈번하게 실행되어 체인지 버퍼가 더 많은 버퍼 풀을 사용할 수 있게 하고자 할 때 사용
+
+  - 체인지 버퍼가 사용 중인 메모리 공간 크기
+
+    ```sql
+    SELECT EVENT_NAME, CURRENT_NUMBER_OF_BYTES_USED
+    FROM performance_schema.memory_summary_global_by_event_name
+    WHERE EVENT_NAME = 'memory/innodb/ibuf0ibuf';
+    
+    # result
+    +-------------------------|------------------------------+
+    | EVENT_NAME              | CURRENT_NUMBER_OF_BYTES_USED |
+    +-------------------------|------------------------------+
+    | memory/innodb/ibuf0ibuf |                          136 |
+    +-------------------------|------------------------------+
+    ```
+
+  - 체인지 버퍼 관련 오퍼레이션 처리 횟수
+
+    ```sql
+    SHOW ENGINE INNODB STATUS;
+    
+    -------------------------------------
+    INSERT BUFFER AND ADAPTIVE HASH INDEX
+    -------------------------------------
+    Ibuf: size 1, free list len 0, seg size 2, 0 merges
+    merged operations:
+     insert 0, delete mark 0, delete 0
+    discarded operations:
+     insert 0, delete mark 0, delete 0
+    ```
+
+<br>
+
+### 4.2.11 리두 로그 및 로그 버퍼
+
+##### DBMS
+
+- 거의 모든 DBMS에서 데이터 파일은 쓰기보다 읽기 성능을 고려한 자료구조 선택
+  - 따라서 데이터 파일 쓰기는 디스크의 랜덤 액세스 필요
+  - 성능 저하를 막기 위해 쓰기 비용이 낮은 자료 구조를 가진 메모리 필요
+
+- MySQL 포함한 대부분 DB 서버는 데이터 변경 내용을 로그로 먼저 기록
+  - 일부 DBMS에서는 리두 로그를 WAL(Write Ahead Log) 로그로 부름
+
+##### redo log
+
+- redo log는 하드웨어/소프트웨어 등 여러 문제로 인해 MySQL 서버 비정상 종료 시 데이터 파일에 기록되지 못한 데이터를 잃지 않게 해주는 안전장치. **ACID 중 D(Durable) 영속성과 가장 밀접하게 연관**
+
+- MySQL 서버에서 트랜잭션이 커밋되어도 데이터 파일은 즉시 디스크로 동기화되지 않는 반면, 리두 로그(트랜잭션 로그)는 항상 디스크로 기록됨
+
+- MySQL 서버 비정상 종료 시 InnoDB 스토리지 엔진의 비일관 데이터 파일
+
+  - **커밋됐지만 데이터 파일에 기록되지 않은 데이터**
+
+    - 리두 로그에 저장된 데이터를 데이터 파일에 다시 복사
+
+  - **롤백됐지만 데이터 파일에 이미 기록된 데이터**
+
+    - 리두 로그로는 해결할 수 없어 언두 로그의 내용을 가져와 데이터 파일에 복사
+
+      (변경이 commit or rollback or transaction 상태였는지 확인하기 위해 redo log 필요)
+
+- 리두 로그 디스크 동기화 주기
+
+  - 트랜잭션 커밋 시 즉시 디스크 기록되도록 시스템 변수 설정 권장
+  - 하지만 트랜잭션 커밋될 때마다 리두 로그를 디스크에 기록하면 부하 유발
+  - `innodb_flush_log_at_trx_commit=1`
+    - `0`: 1초에 한 번씩 리두 로그를 디스크로 기록(write)하고 동기화(sync) 실행. 따라서 최대 1초 동안의 트랜잭션은 커밋되었다고 하더라도 변경한 데이터는 사라질 수 있음
+    - `1`: 트랜잭션이 커밋될 때마다 매번 디스크로 기록되고 동기화까지 수행. 따라서 일단 커밋되면 해당 트랜잭션 변경 데이터는 사라짐
+    - `2`: 커밋될 때마다 디스크로 매번 기록되지만, 실질적 동기화는 1초에 한 번씩 실행. 일단 트랜잭션이 커밋되면 변경 내용이 운영체제의 메모리 버퍼로 기록되는 것이 보장됨. 따라서 MySQL 서버 비정상 종료되더라도 운영체제가 정상 동작 시에는 트랜잭션 데이터 사라지지 않음. 둘 다 비정상일 시 최대 1초 트랜잭션 데이터 사라질 수 있음
+
+  - `innodb_flush_log_at_timeout=1`
+    - 디스크 동기화 간격 조정(변경 이유가 크게 없음)
+
+- 리두 로그 파일 크기 결정
+
+  - 리두 로그 파일들의 전체 크기는 InnoDB 스토리지 엔진의 버퍼 풀 효율성을 결정하므로 신중히 결정해야 함
+  - `innodb_log_file_size`, `innodb_log_files_in_group` 8.0.30 deprecated
+  - `innodb_redo_log_capacity` = innodb_log_file_size * innodb_log_files_in_group
+  - 리두 로그 파일 크기는 버퍼 풀 크기에 맞게 적절히 선택되어야 함
+    - 그래야 변경된 내용을 버퍼 풀에 모았다가 한 번에 모아서 디스크에 기록할 수 있음
+  - 하지만 사용량(특히 변경 작업)이 매우 많은 서버는 리두 로그 기록 작업이 큰 문제가 되므로, 최대한 ACID 속성을 보장하는 수준에서 버퍼링함
+
+##### log buffer
+
+- redo log 버퍼링에 사용되는 메모리
+- 기본값인 16MB 수준 설정이 적합
+  - 예외: BLOB, TEXT 같은 큰 데이터 자주 변경 시에는 더 크게 설정하는 것이 좋음
+
+<br>
+
+##### 4.2.11.1 리두 로그 아카이빙
+
+- 8.0부터 리두 로그 아카이빙 기능 추가
+
+- MySQL 엔터프라이즈 백업 or Xtrabackup 툴
+
+  - 백업 시 데이터 파일 복사하는 동안 InnoDB 스토리지 엔진의 리두 로그에 쌓인 내용 계속 추적하면서 새로 추가된 리두 로그 엔트리를 복사
+  - 백업하는 동안 추가된 리두 로그 엔트리가 같이 백업되지 않으면 복사된 백업 파일은 일관된 상태를 유지하지 못함
+  - 데이터 변경이 너무 많으면 리두 로그가 매우 빠르게 증가하고, 백업이 되기도 전에 덮어쓰여질 수도 있음
+  - 이 때 백업 툴은 리두 로그 엔트리를 복사할 수 없어 백업 실패
+  - **리두 로그 아카이빙 기능은 리두 로그가 덮어쓰여져도 백업 실패하지 않게 해줌**
+    - 로그 파일이 로테이션될 때 복사되는 것이 아님
+    - **리두 로그 파일에 로그 엔트리가 추가될 때 함께 기록하는 방식 사용하고 있어서, 데이터 변경이 발생하면 즉시 아카이빙된 로그 파일의 크기가 조금씩 늘어남**
+
+- 백업 툴이 리두 로그 아카이빙을 사용하게 하는 방법
+
+  - 아카이빙된 리두 로그 저장될 디렉터리 설정
+
+    운영체제의 MySQL 서버 실행하는 유저(일반적으로 mysql 유저)만 접근 가능해야 함
+
+    `innodb_redo_log_archive_dirs={file_path}`
+
+    ```shell
+    linux> mkdir /var/log/mysql_redo_archive
+    lunux> mkdir 20230119
+    linux> chmod 700 20230119
+    
+    mysql> SET GLOBAL \ 
+    innodb_redo_log_archive_dirs='backup:/var/log/mysql_redo_archive';
+    ```
+
+  - 리두 로그 아카이빙 시작
+
+    ```shell
+    mysql> DO innodb_redo_log_archive_start('backup', '20230119');
+    ```
+
+    - UDF(사용자 정의 함수: User Defined Function) 실행
+
+    - 아카이빙 시작하는 UDF는 1개 또는 2개의 파라미터 입력 가능
+
+      (첫번째: 아카이빙 디렉터리 레이블, 두번째: 서브디렉터리 이름 / 두번째 없으면 레이블 디렉터리에 바로 복사)
+
+  - 아카이빙 정상 실행 확인(데이터 변경 작업 시 파일 확인)
+
+  - (리두 로그 아카이빙 종료)
+
+    ```shell
+    mysql> DO innodb_redo_log_archive_stop();
+    ```
+
+    - 단, 세션 비정상 종료 시에는 리두 로그 아카이빙도 멈추고 파일도 자동 삭제
+
+<br>
+
+##### 4.2.11.2 리두 로그 활성화 및 비활성화
+
+- 8.0부터 수동으로 리두 로그 활성화/비활성화 가능
+
+- 데이터 복구나 대용량 데이터 일괄 적재 시에는 리두 로그 비활성화하여 시간 단축
+
+- 명령어
+
+  - 활성화/비활성화
+
+    ```sql
+    ALTER INSTANCE [ENABLE | DISABLE] INNODB REDO_LOG;
+    ```
+
+  - 확인
+
+    ```sql
+    SHOW GLOBAL STATUS LIKE 'Innodb_redo_log_enabled';
+    ```
+
+<br>
+
+### 4.2.12 어댑티브 해시 인덱스
+
+`innodb_adaptive_hash_index=ON|OFF`
+
+##### 개념
+
+- InnoDB 스토리지 엔진에서 사용자가 자주 요청하는 데이터에 대해 자동으로 생성하는 인덱스
+
+  (일반적으로 사용자가 생성하는 B-Tree 인덱스가 아님)
+
+- B-Tree 검색 시간을 줄여주기 위해 도입된 기능
+
+  - B-Tree 검색 시간이 빠르기는 하지만 수천 개의 스레드로 실행하면 CPU도 엄청난 프로세스 스케줄링을 하고 자연히 쿼리의 성능도 떨어짐
+
+##### 동작
+
+- 자주 읽히는 데이터 페이지의 키 값을 이용해 해시 인덱스를 만듦
+
+- 필요할 때마다 어댑티브 해시 인덱스를 검색해 레코드가 저장된 데이터 페이지를 즉시 찾음
+
+  (B-Tree 루트-브랜치-리프 노드 탐색 비용 절약)
+
+##### 구조
+
+- '인덱스 키 값' - '데이터 페이지 주소' 쌍으로 관리
+
+- 인덱스 키
+
+  - B-Tree 인덱스 고유번호(Id)와 실제 키 값 조합으로 생성
+  - Id를 조합하는 이유
+    - 어댑티브 해시 인덱스가 유일
+    - 특정 키 값이 어느 인덱스에 속한 것인지 구분
+
+- 데이터 페이지 주소
+
+  - 실제 키 값이 저장된 데이터 페이지의 메모리 주소를 가짐
+    - InnoDB 버퍼 풀에 로딩된 페이지의 주소 의미
+    - 따라서 어댑티브 해시 인덱스는 버퍼 풀에 올려진 데이터 페이지에 대해서만 관리됨
+    - 버퍼 풀(데이터 페이지 삭제) -> 어댑티브 해시 인덱스(데이터 페이지 정보 삭제)
+
+- 어댑티브 해시 인덱스의 파티션 기능
+
+  `innodb_adaptive_hash_index_parts=8`
+
+  default 8 / min 1 ~ max 512
+
+  - 어댑티브 해시 인덱스는 하나의 메모리 객체
+  - 따라서 경합(Contention)이 상당히 심함
+  - 내부 잠금(세마포어) 경합을 줄이기 위해 파티션 기능 제공
+
+##### 장단점
+
+- 장점(성능 향상에 도움되는 경우)
+
+  - 디스크 데이터가 InnoDB 버퍼 풀 크기와 비슷한 경우(디스크 읽기가 많지 않은 경우)
+  - 동등 조건 검색(동등 비교 / IN 연산자) 많은 경우
+  - 쿼리가 데이터 중에서 일부 데이터에만 집중되는 경우
+
+- 단점(성능 향상에 도움되지 않는 경우)
+
+  - 디스크 읽기가 많은 경우
+  - 특정 패턴의 쿼리가 많은 경우(조인이나 LIKE 패턴 검색)
+  - 매우 큰 데이터를 가진 테이블의 레코드를 폭넓게 읽는 경우
+
+- 테이블 삭제 작업 영향에 많은 영향을 미침
+
+  - 테이블을 drop/alter 할 때 InnoDB 스토리지 엔진은 이 테이블이 가진 모든 데이터 페이지의 내용을 어댑티브 해시 인덱스에서 제거해야 함
+  - 이로 인해 테이블 삭제 또는 스키마 변경 동안 CPU 자원 낭비
+  - **즉, 어댑티브 해시 인덱스의 도움을 많이 받을수록 테이블 삭제 또는 변경 작업(Online DDL 포함)은 더 치명적인 작업이 되는 것** 
+
+- 사용여부 판단
+
+  ```txt
+  SHOW ENGINE INNODB STATUS;
+  
+  INSERT BUFFER AND ADAPTIVE HASH INDEX
+  -------------------------------------
+  Hash table size 34679, node heap has 0 buffer(s)
+  Hash table size 34679, node heap has 0 buffer(s)
+  Hash table size 34679, node heap has 4 buffer(s)
+  Hash table size 34679, node heap has 0 buffer(s)
+  Hash table size 34679, node heap has 0 buffer(s)
+  Hash table size 34679, node heap has 0 buffer(s)
+  Hash table size 34679, node heap has 1 buffer(s)
+  Hash table size 34679, node heap has 0 buffer(s)
+  1.03 hash searches/s, 2.64 non-hash searches/s
+  ...
+  ```
+
+  - hash searches/s 값이 '0'이면 비활성화 상태
+
+  - 위 예제에서는 초당 3.67(2.64+1.03)번의 검색 실행 중 해시 서치는 1.03초
+
+    - searches는 쿼리 실행 횟수가 아닌 쿼리 처리를 위해 내부적으로 키 값 검색이 몇 번 실행되었는지를 의미
+
+    - 위 예제에서 약 28%가 어댑티브 해시 인덱스 이용했음
+
+      (CPU 사용량이 100%에 근접하다면 효율적인데, 높지 않다면 비활성화하여 InnoDB 버퍼 풀이 더 많은 메모리 사용할 수 있도록 유도하는 것도 좋은 방법)
+
+  - 다음의 사항들을 종합적으로 고려
+
+    - hash searches & non-hash searches의 비율(해시 인덱스 히트율)
+    - 사용 메모리 공간
+    - 서버 CPU 사용량 등
+
+<br>
+
+### 4.2.13 InnoDB와 MyISAM, MEMORY 스토리지 엔진 비교
+
+- MyISAM
+  - 8.0이전까지 시스템 테이블(사용자 인증 관련 정보와 복제 관련 정보가 저장된 mysql DB 테이블)과 전문 검색/공간 좌표 검색 기능은 MyISAM만 지원
+
+- InnoDB
+  - 5.5부터 InnoDB 스토리지 엔진이 기본 스토리지 엔진으로 채택
+  - 8.0부터 시스템 테이블, 검색 기능 등 모든 것이 InnoDB 스토리지 엔진으로 교체되거나 지원됨
+
+- Memory
+  - 하나의 스레드에서만 read/write 하면 InnoDB 보다 빠를 수는 있음
+  - MySQL 서버는 일반적으로 온라인 트랜잭션 처리를 위한 목적으로 사용되며, 동시 처리 성능이 매우 중요하므로 단일 스레드로 사용될 경우는 거의 없음
+  - 사용자 쿼리 처리를 위한 내부 임시 테이블
+    - 5.7까지는 MEMORY 스토리지 엔진이 내부 임시 테이블의 용도로 사용됨
+    - 8.0 부터는 MEMORY가 가변 길이 타입의 칼럼 지원하지 않는다는 문제로 인해 TempTable 스토리지 엔진으로 대체
+    - `internal_tmp_mem_storage_engine=[TempTable|MEMORY]`
+  - deprecated 예상
