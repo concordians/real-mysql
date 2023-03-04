@@ -16,6 +16,13 @@
 > - B-Tree 인덱스 사용에 영향을 미치는 요소
 >
 >   (컬럼의 크기, 유니크한 인덱스 키 값의 개수, 레코드의 건수)
+>
+> - [B-Tree 인덱스를 통한 데이터 읽기](#8.3.4-B-Tree-인덱스를-통한-데이터-읽기)
+>   - index range scan
+>   - index full scan
+>   - index skip scan(loose index scan)
+> - [다중 컬럼(Multi-column) 인덱스](#8.3.5-다중 컬럼(Multi-column)-인덱스)
+> - [B-Tree 인덱스의 정렬 및 스캔 방향](#8.3.6-B-Tree-인덱스의-정렬-및-스캔-방향)
 
 <br>
 
@@ -351,3 +358,250 @@ SDD(Solid State Drive)
   - 일반적인 DMBS의 옵티마이저에서 인덱스를 통해 레코드 1건을 읽는 것이 테이블에서 직접 레코드 1건을 읽는 것보다 4~5배 정도 비용이 더 드는 작업으로 예측(10.1.3 코스트 모델 참조)
   - 인덱스를 통해 읽어야할 레코드 건수(옵티마이저가 판단한 예상 건수)가 전체 20~25% 넘어가면 인덱스 이용하지 않는 것이 더 효율적
 
+<br>
+
+### 8.3.4 B-Tree 인덱스를 통한 데이터 읽기
+
+##### 8.3.4.1 인덱스 레인지 스캔
+
+- 인덱스 접근 방법 중 가장 대표적인 접근 방식
+
+  (한 건만 읽는 것은 unique scan이라고 부르는데, 이런 경우는 흔치 않음. 10장 실행계획 참조)
+
+- 스캔 과정
+
+  - 인덱스에서 조건을 만족하는 값이 저장된 위치 찾음(index seek)
+  - 1번에서 탐색된 위치부터 필요한 인덱스를 차례대로 쭉 읽음(index scan)
+  - 2번에서 읽은 인덱스 키와 레코드 주소로 저장 페이지를 가져와 최종 레코드를 읽음
+
+- 스캔 과정 수행 확인
+
+  ```sql
+  SHOW STATUS LIKE 'Handler_%';
+  ```
+
+  - Handler_read_key: 1번 단계의 index seek 실행 횟수
+  - Handler_read_next/prev: 인덱스 forward/backward로 읽은 레코드 건수
+  - Handler_read_first/last: 인덱스의 첫 번째와 마지막 레코드 읽은 횟수(min(), max()와 같이 제일 큰 값 또는 제일 작은 값만 읽는 경우 증가하는 상태값)
+
+- 예시1(인덱스 컬럼만 select 시)
+
+  ```sql
+  SELECT * FROM employees WHERE first_name BETWEEN 'Ebbe' AND 'Gad';
+  ```
+
+  <img src="./images/8-8.png" alt="drawing" width="60%" align="left" />
+
+  <br>
+
+  - 검색해야 할 인덱스의 범위가 결정됐을 때 사용하는 방식
+  - 루트 -> 브랜치 -> 리프 노드 순으로 레코드 시작 지점 탐색
+  - 일단 시작 위치 찾으면 리프 노드 레코드만 순서대로 읽으면 됨
+
+- 예시2(인덱스 컬럼 포함 실제 데이터 파일 레코드 select 시)
+
+  <img src="./images/8-9.png" alt="drawing" width="60%" align="left" />
+
+  <br>
+
+  - 위 인덱스 컬럼 select 과정 이후 리프 노드에 저장된 레코드 주소로 데이터 파일의 레코드를 읽음
+  - 레코드 건 당 랜덤 I/O가 한 번씩 발생
+    - 인덱스를 통한 data record 검색 비용이 큰 이유
+    - index seek + index scan + random I/O
+
+- 커버링 인덱스
+  - 스캔 과정 3번째가 필요 없는 `예시1`
+  - 디스크의 레코드 읽지 않아도 되어 랜덤 I/O 줄어들고 성능 빨라짐
+
+<br>
+
+##### 8.3.4.2 인덱스 풀 스캔
+
+<img src="./images/8-10.png" alt="drawing" width="70%" align="left" />
+
+<br>
+
+- 인덱스의 처음부터 끝까지 모두 읽는 방식(인덱스 컬럼 순으로 조회하지 않는 경우)
+  - 인덱스 리프 노드의 제일 앞 또는 뒤로 이동 후 리프 노드 Linked List를 따라 스캔
+- 인덱스의 크기는 테이블 보다 작으므로 테이블 풀 스캔 보다는 효율적
+- 쿼리가 인덱스에 명시된 컬럼만으로 조건을 처리할 수 있는 경우 사용
+  - 인덱스 컬럼 + 데이터 레코드 모두 읽어야 하면 절대 인덱스 풀 스캔으로 처리되지 않음
+
+<br>
+
+##### 8.3.4.3 루스(Loose) 인덱스 스캔
+
+<img src="./images/8-11.png" alt="drawing" width="70%" align="left" />
+
+<br>
+
+- ORACLE index skip scan과 작동방식 비슷
+
+- loose index scan <-> tight index scan(index skip scan, index full scan)
+
+- 필요치 않은 인덱스 키 값은 무시(skip)하고 넘어가는 형태로 처리
+
+- 일반적으로 GROUP BY, 집합 함수 중 MAX(), MIN() 함수에 대한 최적화 시 사용
+
+- 예시
+
+  ```sql
+  SELECT dept_no, MIN(emp_no)
+  FROM dept_emp
+  WHERE dept_no BETWEEN 'd002' AND 'd004'
+  GROUP BY dept_no;
+  ```
+
+  - dept_no, emp_no 컬럼으로 인덱스 생성되었다고 가정
+  - dept_no 그룹별로 emp_no 값만 읽으면 됨
+  - where 조건 만족하는 범위 전체 스캔 필요가 없다는 것을 옵티마이저가 알아서 조건 만족하지 않는 dept_no 그룹은 skip
+
+<br>
+
+##### 8.3.4.4 인덱스 스킵 스캔
+
+```sql
+ALTER TABLE employees
+  ADD INDEX ix_gender_birthdate (gender, birth_date);
+  
+SELECT * FROM employees WHERE birth_date >= '1965-02-01';
+```
+
+- 8.0 버전부터 옵티마이저가 gender 컬럼 건너뛰어 birth_date 컬럼만으로 인덱스 검색이 가능하게 해주는 index skip scan 최적화 기능 도입
+
+- index skip scan이 없다면 index full scan 할 것이므로 인덱스를 비효율적으로 사용하게 됨
+
+  (심지어 birth_date가 65년 이상인 데이터만 있었으면 table full scan 했을 것)
+
+- 동작 방식
+
+  <img src="./images/8-12.png" alt="drawing" width="70%" align="left" />
+
+  <br>
+
+  - 옵티마이저는 gender 컬럼에서 유니크한 값을 모두 조회
+
+  - 주어진 쿼리에 gender zㅓㄹ럼의 조건을 추가해서 쿼리를 다시 실행
+
+    ```sql
+    -- gender 컬럼이 'M', 'F'만 있다면
+    SELECT gender, birth_date FROM employees WHERE gender='M' and birth_date >= '1965-02-01';
+    SELECT gender, birth_date FROM employees WHERE gender='F' and birth_date >= '1965-02-01';
+    ```
+
+- 단점
+
+  - (조건절 미명시된) 인덱스 선행 칼럼의 unique value 수가 적어야 함
+    - 쿼리 실행 계획의 비용과 관련
+    - unique value가 매우 많으면 옵티마이저는 인덱스에서 스캔해야 할 시작 지점을 검색하는 작업이 많이 필요해져서 처리 성능이 오히려 더 느려질 수도 있음
+  - 쿼리가 인덱스에 존재하는 컬럼으로만 처리 가능해야 함(커버링 인덱스)
+    - 그렇지 않으면 table full scan
+
+<br>
+
+### 8.3.5 다중 컬럼(Multi-column) 인덱스
+
+> 다중 컬럼 인덱스, 복합 컬럼 인덱스, concatenated 인덱스라고도 불림
+
+<img src="./images/8-13.png" alt="drawing" width="60%" align="left" />
+
+- 인덱스의 핵심은 정렬인데, 선행 컬럼에 의존해서 정렬됨
+- 인덱스 내 각 컬럼의 위치(순서)가 상당히 중요해서 신중히 결정해야 함
+
+<br>
+
+### 8.3.6 B-Tree 인덱스의 정렬 및 스캔 방향
+
+##### 8.3.6.1 인덱스의 정렬
+
+- 인덱스 구성 컬럼의 정렬 설정 가능
+
+  ```sql
+  CREATE INDEX ix_teamname_userscore ON employees (team_name ASC, user_score DESC);
+  ```
+
+##### 8.3.6.2 인덱스 스캔 방향
+
+<img src="./images/8-14.png" alt="drawing" width="60%" align="left" />
+
+- 예시1
+
+  ```sql
+  -- 오름차순 읽기
+  SELECT * FROM employees
+  WHERE first_name >= 'Anneke'
+  ORDER BY first_name ASC
+  LIMIT 4;
+  
+  -- 내림차순 읽기
+  SELECT * FROM employees
+  WHERE first_name >= 'Anneke'
+  ORDER BY first_name DESC
+  LIMIT 4;
+  ```
+
+  - first_name 인덱스는 오름차순으로 정렬되더라도, 인덱스의 처음과 끝 중에 어디서부터 시작하느냐에 따라 오름/내림차순으로 읽을 수 있음
+  - 쿼리의 ORDER BY, MIN(), MAX() 함수 등의 최적화가 필요한 경우에도 옵티마이저는 인덱스의 읽기 방향을 전환해서 사용하도록 실행 계획을 만듦
+
+- 예시2(first_name 역순 정렬 요건만 있는 경우)
+
+  ```sql
+  -- 어떤 것이 더 효율적인가?
+  CREATE INDEX ix_firstname_asc  ON employees (first_name ASC);
+  CREATE INDEX ix_firstname_desc ON employees (first_name DESC);
+  ```
+
+  <img src="./images/8-15.png" alt="drawing" width="70%" align="left" />
+
+  - Ascending index: 작은 값의 인덱스 키가 B-Tree 왼쪽으로 정렬
+  - Descending index: 큰 값의 인덱스 키가 B-Tree 왼쪽으로 정렬
+  - Forward index scan: 리프 노드 왼쪽 -> 오른쪽 스캔(인덱스 키 대소 상관 없음)
+  - Backward index scan: 리프 노드 오른쪽 -> 왼쪽 스캔(인덱스 키 대소 상관 없음)
+
+<br>
+
+- **내림차순 인덱스의 필요성**
+
+  - ORDER BY ... DESC 쿼리가, 많은 레코드 조회하면서 빈번히 실행된다면 내림차순 인덱스가 효율적
+  - 많은 쿼리가 인덱스의 앞쪽 또는 뒤쪽만 집중적으로 읽어서 특정 페이지 잠금이 병목될 것으로 예상되면, 자주 사용되는 정렬 순서대로 인덱스 생성하는 것이 잠금 병목 현상 완화에 도움
+
+  ```sql
+  CREATE TABLE t1 (
+  	tid INT NOT NULL AUTO_INCREMENT,
+    TABLE_NAME VARCHAR(64),
+    COLUMN_NAME VARCHAR(64),
+    ORDINAL_POSITION INT,
+    PRIMARY KEY(tid)
+  ) ENGINE=InnoDB;
+  ```
+
+  ```sql
+  -- LIMIT ... OFFSET ... 쿼리로 인해 table full scan 발생
+  
+  -- 1 row in set (4.15 sec)
+  SELECT * FROM t1
+  ORDER BY tid ASC
+  LIMIT 12619775,1;
+  
+  -- 1 row in set (5.35 sec)
+  SELECT * FROM t1
+  ORDER BY tid DESC
+  LIMIT 12619775,1;
+  ```
+
+  - 인덱스를 정순/역순으로 읽는지에 따라 차이 발생
+
+    (1,200만건 스캔 시 역순 정렬 쿼리가 28.9% 시간 더 걸림)
+
+  - 원인
+
+    - 페이지 잠금이 forward index scan에 적합한 구조
+
+    - 페이지 내에서 index record가 단방향으로만 연결된 구조
+
+      (InnoDB 페이지 내부에서 레코드들이 단방향으로만 링크를 가진 구조)
+
+      <img src="./images/8-16.png" alt="drawing" width="60%" align="left" />
+
+      - InnoDB 페이지 내부에서 레코드들이 정렬 순서대로 저장되어 있어 보이지만, 실제로는 heap 처럼 사용되므로 순서 보장하지 않음
+      - InnoDB 스토리지 엔진에서 데이터 파일은 pk index 자체라는 것에 주의
