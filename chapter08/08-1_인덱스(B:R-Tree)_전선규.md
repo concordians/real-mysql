@@ -1,4 +1,4 @@
-# 8. 인덱스
+# 8. 인덱스(B/R-Tree)
 
 > [8.1 디스크 읽기 방식](#8.1-디스크-읽기-방식)
 >
@@ -23,6 +23,12 @@
 >   - index skip scan(loose index scan)
 > - [다중 컬럼(Multi-column) 인덱스](#8.3.5-다중 컬럼(Multi-column)-인덱스)
 > - [B-Tree 인덱스의 정렬 및 스캔 방향](#8.3.6-B-Tree-인덱스의-정렬-및-스캔-방향)
+> - [B-Tree 인덱스의 가용성과 효율성](#8.3.7-B-Tree-인덱스의-가용성과-효율성)
+>
+> [8.4 R-Tree 인덱스](#8.4-R-Tree-인덱스)
+>
+> - 구조 및 특성
+> - 용도
 
 <br>
 
@@ -505,6 +511,8 @@ SELECT * FROM employees WHERE birth_date >= '1965-02-01';
 
 <img src="./images/8-13.png" alt="drawing" width="60%" align="left" />
 
+<br>
+
 - 인덱스의 핵심은 정렬인데, 선행 컬럼에 의존해서 정렬됨
 - 인덱스 내 각 컬럼의 위치(순서)가 상당히 중요해서 신중히 결정해야 함
 
@@ -523,6 +531,8 @@ SELECT * FROM employees WHERE birth_date >= '1965-02-01';
 ##### 8.3.6.2 인덱스 스캔 방향
 
 <img src="./images/8-14.png" alt="drawing" width="60%" align="left" />
+
+<br>
 
 - 예시1
 
@@ -553,6 +563,8 @@ SELECT * FROM employees WHERE birth_date >= '1965-02-01';
 
   <img src="./images/8-15.png" alt="drawing" width="70%" align="left" />
 
+  <br>
+  
   - Ascending index: 작은 값의 인덱스 키가 B-Tree 왼쪽으로 정렬
   - Descending index: 큰 값의 인덱스 키가 B-Tree 왼쪽으로 정렬
   - Forward index scan: 리프 노드 왼쪽 -> 오른쪽 스캔(인덱스 키 대소 상관 없음)
@@ -603,5 +615,225 @@ SELECT * FROM employees WHERE birth_date >= '1965-02-01';
 
       <img src="./images/8-16.png" alt="drawing" width="60%" align="left" />
 
+      <br>
+      
       - InnoDB 페이지 내부에서 레코드들이 정렬 순서대로 저장되어 있어 보이지만, 실제로는 heap 처럼 사용되므로 순서 보장하지 않음
       - InnoDB 스토리지 엔진에서 데이터 파일은 pk index 자체라는 것에 주의
+
+<br>
+
+### 8.3.7 B-Tree 인덱스의 가용성과 효율성
+
+> 쿼리 최적화나 쿼리에 맞게 인덱스를 최적 생성하려면?
+>
+> - where 조건, group by, order by 절이 어떤 경우 인덱스를 사용할 수 있고, 어떤 방식으로 사용할 수 있는지 식별할수 있어야 함
+
+##### 8.3.7.1 비교 조건의 종류와 효율성
+
+- 다중 컬럼 인덱스에서 각 컬럼의 순서와 사용 조건이 **동등 비교**(`=`)인지 **범위 조건**(`>` `<`)인지에 따라 인덱스 컬럼의 활용 형태와 효율이 달라짐
+
+- 예시
+
+  ```sql
+  SELECT * FROM dept_emp
+  WHERE dept_no = 'd002' AND emp_no >= 10114;
+  
+  INDEX (dept_no, emp_no)  # case A
+  INDEX (emp_no, dept_no)  # case B
+  ```
+
+  <img src="./images/8-17.png" alt="drawing" width="60%" align="left" />
+
+  <br>
+
+  - case A(**작업 범위 결정 조건**)
+    - `dept_no = 'd002' AND emp_no >= 10144` 레코드 찾고, 이후에 dept_no가 'd002'가 아닐 때까지 index range scan 하면 됨
+    - 읽은 레코드가 모두 사용자가 원하는 결과(효율적인 인덱스 사용)
+  - case B(**필터링 조건 or 체크 조건**)
+    - `emp_no >= 10144 AND dept_no = 'd002'` 인 레코드를 찾고 그 이후에 dept_no가 'd002'인지 비교하는 과정 거쳐야 함
+    - 인덱스를 통해 읽은 레코드가 나머지 조건에 맞는지 비교하면서 취사선택하는 작업
+  - 원인
+    - 다중 컬럼 인덱스의 정렬 방식(인덱스의 N번째 키 값은 N-1번째 키 값에 대해서 다시 정렬) 때문
+    - case A는 비교 작업의 범위를 좁히는 데 도움을 줬지만, case B는 작업 범위를 좁히지 못하고 단지 쿼리 조건에 맞는지 검사하는 용도로만 사용
+
+<br>
+
+##### 8.3.7.2 인덱스의 가용성
+
+- B-Tree 인덱스의 특징은 왼 쪽 값 기준(Left-most)으로 오른쪽 값 정렬
+
+  - 왼쪽이라 함은 하나의 컬럼 and 다중 컬럼 인덱스의 컬럼도 함께 적용
+
+- 예시
+
+  <img src="./images/8-18.png" alt="drawing" width="60%" align="left" />
+
+  <br>
+
+  ```sql
+  INDEX (first_name)  # case A
+  INDEX (dept_no, emp_no)  # case B
+  ```
+
+  - 단일 컬럼 왼쪽 부분이 없으면 index range scan 검색 불가
+
+  - 다중 컬럼에서도 왼쪽 컬럼의 값을 모르면 index range scan 검색 불가
+
+  - case A
+
+    ```sql
+    SELECT * FROM employees WHERE first_name LIKE '%mer';
+    ```
+
+    - index range scan 불가
+    - first_name 컬럼 저장 값을 왼쪽부터 한 글자씩 비교하며 일치 레코드 찾을 수 없음
+
+  - case B
+
+    ```sql
+    SELECT * FROM dept_emp WHERE emp_no >= 10144;
+    ```
+
+    - dept_no으로 정렬 후 다시 emp_no 정렬되었으므로 인덱스 효율적으로 사용할 수 없음
+
+<br>
+
+##### 8.3.7.3 가용성과 효율성 판단
+
+- '작업 범위 결정 조건' 사용불가 케이스
+
+  - NOT-EQUAL 비교 `<>`, `not in`, `NOT BETWEEN`, `IS NOT NULL` 
+  - LIKE '%??' 형태 문자열 비교
+    - `WHERE column LIKE '%서울'`
+    - `WHERE column LIKE '_서울'`
+    - `WHERE column LIKE '%서울%'`
+  - 스토어드 함수나 다른 연산자로 인덱스 컬럼이 변형된 후 비교
+    - `WHERE SUBSTRING(column, 1, 1) = 'X'`
+    - `WHERE DAYOFMONTH(column) = 1`
+  - NOT-DETERMINISTIC 속성 스토어드 함수가 비교 조건에 사용
+    - `WHERE column = deterministic_function()`
+  - 데이터 타입이 다른 비교
+    - `WHERE char_column = 10`
+  - 문자열 데이터 타입의 콜레이션이 다른 경우
+    - `WHERE utf8_bin_char_column = euckr_bin_char_column`
+
+- 다중 컬럼 인덱스 사용 시 '작업 범위 결정 조건' 사용불가 케이스
+
+  ```sql
+  INDEX ix_test (column_1, column_2, ..., column_n);
+  ```
+
+  - 작업 범위 결정 조건으로 인덱스를 사용불가 경우
+    - column_1 컬럼에 대한 조건 없는 경우
+    - column_1 컬럼의 비교 조건이 위의 인덱스 사용 불가 조건 중 하나인 경우
+  - 작업 범위 결정 조건으로 인덱스 사용하는 경우
+    - column_1 ~ column_(i-1) 컬럼까지 동등 비교 형태(`=`, `in`)로 비교
+    - column_i 컬럼에 대해 다음 연산자 중 다음 연산자 중 하나로 비교
+      - 동등 비교(`=`, `in`)
+      - 크다 작다 형태(`>`, `<`)
+      - LIKE 좌측 일치(`LIKE '서울%'`)
+    - 2가지 조건을 모두 만족하면 column_i까지 작업 범위 결정 조건으로 사용되고, column_(i+1) 부터는 체크 조건으로 사용
+
+<br>
+
+## 8.4 R-Tree 인덱스
+
+> Rectangle의 'R'과 B-Tree의 'Tree'를 섞어서 'R-Tree'
+>
+> 공간 인덱스(Spatial Index)
+>
+> - R-Tree 인덱스 알고리즘을 이용해 2차원 데이터를 인덱싱하고 검색하는 목적의 인덱스
+> - 내부 메커니즘은 B-Tree와 유사
+> - R-Tree 인덱스 구성 컬럼 2차원 공간 개념 값 vs B-Tree 인덱스 구성 컬럼 1차원 스칼라 값
+>
+> 공간 확장(Spatial Extension)의 3가지 기능(사용 시 위치 기반 서비스 구현 가능)
+>
+> - 공간 데이터 저장할 수 있는 데이터 타입
+> - 공간 데이터 검색을 위한 공간 인덱스(R-Tree 알고리즘)
+> - 공간 데이터 연산 함수(거리 또는 포함 관계의 처리)
+
+### 8.4.1 구조 및 특성
+
+##### MySQL 지원 데이터 타입
+
+<img src="./images/8-19.png" alt="drawing" width="60%" align="left" />
+
+<br>
+
+- 기하학적 도형(Geometry) 정보 관리할 수 있는 데이터 타입
+- geometry 타입은 나머지 3개의 슈퍼 타입으로 point, line, polygon 객체 모두 저장 가능
+
+##### MBR(Minimum Bounding Rectangle)
+
+- R-Tree 알고리즘 이해를 위한 개념
+
+- 도형을 감싸는 최소 크기의 사각형
+
+  (R-Tree 인덱스는 이 사각형들의 포함 관계를 B-Tree 형태로 구현한 것)
+
+- 8.19 도형의 MBR 예시
+
+  <img src="./images/8-20.png" alt="drawing" width="60%" align="left" />
+
+<br>
+
+##### R-Tree의 구조
+
+<img src="./images/8-21.png" alt="drawing" width="60%" align="left" />
+
+<img src="./images/8-22.png" alt="drawing" width="60%" align="left" />
+
+<br>
+
+- level
+  - 최상위: R1, R2
+    - R-Tree 루트 노드 저장 정보
+  - 차상위(도형 객체의 그룹): R3 ~ R6
+    - R-Tree 브랜치 노드 저장 정보
+  - 최하위(각 도형): R7 ~ R14
+    - R-Tree 리프 노드 저장 정보
+
+- R-Tree 인덱스로 표현한 구조
+
+  <img src="./images/8-23.png" alt="drawing" width="75%" align="left" />
+
+<br>
+
+### 8.4.2 R-Tree 인덱스의 용도
+
+- 일반적으로 WGS84(GPS) 기준의 위도, 경도 좌표 저장에 주로 사용
+
+  (현재 사용자 위치로부터 반경 5km 이내 음식점 검색 등)
+
+- CAD/CAM 소프트웨어 또는 회로 디자인 등과 같은 좌표 시스템 기반 정보에도 적용 가능
+
+- 사용 제약
+
+  - MBR의 포함 관계를 이용해 만들어진 인덱스이므로 `ST_Contains()`, `ST_Within()` 같은 포함 관계를 비교하는 함수로 검색해야만 인덱스 이용 가능
+
+- 예시(기준점으로부터 반경 5km 검색)
+
+  <img src="./images/8-24.png" alt="drawing" width="60%" align="left" />
+
+  <br>
+
+  ```sql
+  -- ST_Contains() 또는 ST_Within() 이용해 'rectangle'에 포함된 좌표 Px만 검색
+  SELECT * FROM tb_location
+  WHERE ST_Contains(rectangle, px);
+  
+  SELECT * FROM tb_location
+  WHERE ST_Within(px, rectangle);
+  ```
+
+  - 위 2개 연산은 다각형(Polygon)으로만 연산 가능하므로 원을 포함한 MBR로 포함 관계 비교 수행
+
+  - P6는 5km를 넘어서지만 최소 사각형에 포함되므로, 빼고 싶으면 더 복잡한 비교 필요함
+
+    ```sql
+    SELECT * FROM tb_location
+    WHERE ST_Contains(rectangle, px)
+      AND ST_Distance_Sphere(p, px <= 5 * 1000);
+    ```
+
+    
