@@ -18,8 +18,16 @@
 
 | 챕터                              | 정리 자료 |
 | --------------------------------- | :-------- |
-| 01장. 소개                         | - |
-| 02장. 설치와 설정                    |  |
+| 01장. 소개                         | [link](https://github.com/concordians/real-mysql/tree/main/chapter01) |
+| 02장. 설치와 설정                    | [link](https://github.com/concordians/real-mysql/tree/main/chapter02) |
+| 03장. 사용자 및 권한    | [link](https://github.com/concordians/real-mysql/tree/main/chapter03) |
+| 04장. InnoDB 스토리지 엔진 아키텍처 | [link](https://github.com/concordians/real-mysql/tree/main/chapter04) |
+| 05장. 트랜잭션과 잠금           | [link](https://github.com/concordians/real-mysql/tree/main/chapter05) |
+| 06장. 데이터 압축             | [link](https://github.com/concordians/real-mysql/tree/main/chapter06) |
+| 07장. 데이터 암호화            | [link](https://github.com/concordians/real-mysql/tree/main/chapter07) |
+| 08장. 인덱스                | [link](https://github.com/concordians/real-mysql/tree/main/chapter08) |
+| 09장. 옵티마이저와 힌트          | [link](https://github.com/concordians/real-mysql/tree/main/chapter09) |
+| 10장. 실행계획    | [link](https://github.com/concordians/real-mysql/tree/main/chapter10) |
 
 <br>
 
